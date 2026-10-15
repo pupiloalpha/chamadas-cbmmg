@@ -1,5 +1,5 @@
 [project]
-name = "cbmmg-chamadas-dashboard"
+name = "chamadas-cbmmg"
 version = "0.1.0"
 description = "Dashboard operacional de chamadas ativas do CBMMG."
 readme = "README.md"
