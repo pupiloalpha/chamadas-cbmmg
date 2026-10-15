@@ -1,11 +1,15 @@
 [project]
-name = "blank-app-template"
+name = "cbmmg-chamadas-dashboard"
 version = "0.1.0"
-description = "A simple Streamlit app template."
+description = "Dashboard operacional de chamadas ativas do CBMMG."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "streamlit>=1.61.1",
+    "pandas>=2.0",
+    "plotly>=5.0",
+    "folium>=0.19",
+    "streamlit-folium>=0.22",
 ]
 
 [tool.uv]
