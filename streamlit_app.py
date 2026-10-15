@@ -7,6 +7,7 @@
 # -------------------------------------------------------------
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -178,11 +179,29 @@ TIPO_SERVICO = {
 # Caminhos
 # -------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data")).expanduser()
 
-CAMINHO_JSON = DATA_DIR / "Chamadas_Ativas.json"
-CAMINHO_NATUREZAS = DATA_DIR / "naturezas.json"
-CAMINHO_UNIDADES = DATA_DIR / "unidade.csv"
+
+def resolve_data_path(nome_arquivo: str) -> Path:
+    """Resolve um arquivo de dados em ordem segura: variável de ambiente, pasta data, raiz do app."""
+    candidatos = []
+    env_dir = os.environ.get("DATA_DIR")
+    if env_dir:
+        candidatos.append(Path(env_dir) / nome_arquivo)
+    candidatos.extend([
+        BASE_DIR / "data" / nome_arquivo,
+        BASE_DIR / nome_arquivo,
+    ])
+
+    for candidato in candidatos:
+        if candidato.exists():
+            return candidato
+    return candidatos[0] if candidatos else BASE_DIR / "data" / nome_arquivo
+
+
+CAMINHO_JSON = resolve_data_path("Chamadas_Ativas.json")
+CAMINHO_NATUREZAS = resolve_data_path("naturezas.json")
+CAMINHO_UNIDADES = resolve_data_path("unidade.csv")
 
 
 # -------------------------------------------------------------
@@ -544,12 +563,22 @@ def enriquecer_com_unidades(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
 # -------------------------------------------------------------
 # Validação de arquivos
 # -------------------------------------------------------------
-if not CAMINHO_JSON.exists():
-    st.error(f"Arquivo `{CAMINHO_JSON.name}` não encontrado.")
-    st.stop()
-
-if not CAMINHO_NATUREZAS.exists():
-    st.error(f"Arquivo `{CAMINHO_NATUREZAS.name}` não encontrado.")
+if not CAMINHO_JSON.exists() or not CAMINHO_NATUREZAS.exists():
+    st.warning(
+        "Arquivos de dados não foram encontrados em `data/` nem na raiz do projeto. "
+        "O dashboard será exibido em modo vazio para evitar falha no deploy. "
+        "Configure a variável de ambiente `DATA_DIR` ou adicione os arquivos esperados."
+    )
+    df = pd.DataFrame(columns=COLUNAS_FINAIS)
+    atualizado_em = "N/D"
+    total_api = 0
+    unidade_lookup = {}
+    tem_unidades = False
+    df = enriquecer_com_unidades(df, {})
+    st.info(
+        "Arquivos esperados: `Chamadas_Ativas.json`, `naturezas.json` e `unidade.csv`. "
+        "Quando esses arquivos estiverem disponíveis, o painel será preenchido automaticamente."
+    )
     st.stop()
 
 # -------------------------------------------------------------
