@@ -1,21 +1,24 @@
-# dashboard_chamadas_ativas.py
+# streamlit_app.py
 # -------------------------------------------------------------
 # Dashboard CBMMG - Chamadas Ativas (COBOM-BH)
-# Fonte: Chamadas_Ativas.json (dump da API CAD)
-#        naturezas.json (catálogo DIAO / ITO 25)
-#        unidade.csv (cadastro de unidades — filtros COB/BBM/CIA IND)
+# Fonte: API CAD (https://apicadbm.bombeiros.mg.gov.br)
+#        naturezas.json (catálogo DIAO / ITO 25)  → via API
+#        unidade.csv (cadastro de unidades)        → via API
 # -------------------------------------------------------------
 
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import folium
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 from folium.plugins import MarkerCluster
+from streamlit_autorefresh import st_autorefresh
 from streamlit_folium import st_folium
 
 # -------------------------------------------------------------
@@ -26,6 +29,9 @@ st.set_page_config(
     page_icon="🚒",
     layout="wide",
 )
+
+# ---- Autorefresh a cada 10 minutos ----
+st_autorefresh(interval=10 * 60 * 1000, key="data_refresh")
 
 # ---- Detecção do tema ativo (light / dark) ----
 try:
@@ -176,39 +182,106 @@ TIPO_SERVICO = {
 }
 
 # -------------------------------------------------------------
-# Caminhos
+# Caminhos e configuração da API
 # -------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data")).expanduser()
 
+# Token: lê de st.secrets ou variável de ambiente
+try:
+    TOKEN = st.secrets["CBM_API_TOKEN"]
+except (KeyError, FileNotFoundError):
+    TOKEN = os.environ.get("CBM_API_TOKEN")
 
-def resolve_data_path(nome_arquivo: str) -> Path:
-    """Resolve um arquivo de dados em ordem segura: variável de ambiente, pasta data, raiz do app."""
-    candidatos = []
-    env_dir = os.environ.get("DATA_DIR")
-    if env_dir:
-        candidatos.append(Path(env_dir) / nome_arquivo)
-    candidatos.extend([
-        BASE_DIR / "data" / nome_arquivo,
-        BASE_DIR / nome_arquivo,
-    ])
+if not TOKEN:
+    st.error(
+        "❌ Token da API não configurado. "
+        "Defina `CBM_API_TOKEN` em `.streamlit/secrets.toml` ou como variável de ambiente."
+    )
+    st.stop()
 
-    for candidato in candidatos:
-        if candidato.exists():
-            return candidato
-    return candidatos[0] if candidatos else BASE_DIR / "data" / nome_arquivo
+BASE_URL = "https://apicadbm.bombeiros.mg.gov.br"
 
+# Intervalos (segundos)
+INTERVALO_MINIMO_ENTRE_CHAMADAS = 5
+INTERVALO_OPERACAO = 30  # não usado diretamente, pois o cache cuida disso
+TTL_DADOS_OPERACIONAIS = 600  # 10 minutos
+TTL_CATALOGOS = 86400  # 24 horas (auxiliares)
 
-CAMINHO_JSON = resolve_data_path("Chamadas_Ativas.json")
-CAMINHO_NATUREZAS = resolve_data_path("naturezas.json")
-CAMINHO_UNIDADES = resolve_data_path("unidade.csv")
+# Sessão HTTP com header de autenticação
+_sessao = requests.Session()
+_sessao.headers["Authorization"] = f"Bearer {TOKEN}"
+_ultima_chamada = 0.0
 
 
 # -------------------------------------------------------------
-# Utilidades genéricas
+# Funções de API
+# -------------------------------------------------------------
+class TokenInvalido(Exception):
+    pass
+
+
+class ConjuntoAusente(Exception):
+    pass
+
+
+def _chamar_api(rota: str) -> dict:
+    """Faz uma chamada à API respeitando o intervalo mínimo de 5 s e tratando erros."""
+    global _ultima_chamada
+
+    for tentativa in range(3):
+        espera = INTERVALO_MINIMO_ENTRE_CHAMADAS - (time.monotonic() - _ultima_chamada)
+        if espera > 0:
+            time.sleep(espera)
+
+        _ultima_chamada = time.monotonic()
+        try:
+            resp = _sessao.get(BASE_URL + rota, timeout=30)
+        except requests.RequestException as exc:
+            if tentativa == 2:
+                raise RuntimeError(f"Falha de rede em {rota}: {exc}")
+            time.sleep(10)
+            continue
+
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 401:
+            raise TokenInvalido("Credencial inválida. Verifique o token da API.")
+        if resp.status_code == 404:
+            raise ConjuntoAusente(f"Conjunto {rota} ainda não foi gravado na API.")
+        if resp.status_code == 429:
+            retry = float(resp.headers.get("Retry-After", 30))
+            time.sleep(max(retry, INTERVALO_MINIMO_ENTRE_CHAMADAS))
+            continue
+        if resp.status_code == 503:
+            time.sleep(120)
+            continue
+        resp.raise_for_status()
+
+    raise RuntimeError(f"{rota}: sem resposta válida após tentativas espaçadas.")
+
+
+@st.cache_data(ttl=TTL_DADOS_OPERACIONAIS, show_spinner="Carregando chamadas ativas da API…")
+def buscar_chamadas_api() -> dict:
+    """Busca o payload de /ativos/chamadas (com cache de 10 min)."""
+    return _chamar_api("/ativos/chamadas")
+
+
+@st.cache_data(ttl=TTL_CATALOGOS, show_spinner="Carregando naturezas…")
+def buscar_naturezas_api() -> dict:
+    """Busca o catálogo de naturezas (cache de 24 h)."""
+    return _chamar_api("/dados-auxiliares/naturezas")
+
+
+@st.cache_data(ttl=TTL_CATALOGOS, show_spinner="Carregando unidades…")
+def buscar_unidades_api() -> dict:
+    """Busca o cadastro de unidades (cache de 24 h)."""
+    return _chamar_api("/dados-auxiliares/unidades-servico")
+
+
+# -------------------------------------------------------------
+# Utilidades genéricas (mantidas do código original)
 # -------------------------------------------------------------
 def to_list(x):
-    """Normaliza um campo que pode ser dict único ou lista."""
     if x is None:
         return []
     if isinstance(x, list):
@@ -219,7 +292,6 @@ def to_list(x):
 
 
 def ms_to_dt(value):
-    """Converte epoch em milissegundos (string) para datetime SP."""
     if value in (None, "", "0"):
         return pd.NaT
     try:
@@ -288,35 +360,15 @@ COLUNAS_FINAIS = [
 
 
 # -------------------------------------------------------------
-# Carregamento das naturezas (catálogo ITO 25 / DIAO)
+# Processamento dos dados (adaptado para receber payload da API)
 # -------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def carregar_naturezas(caminho: str) -> dict:
-    with open(caminho, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-    itens = payload.get("dados", {}).get("value", [])
-    lookup: dict = {}
-    for nat in itens:
-        nat_id = nat.get("id")
-        if nat_id is None:
-            continue
-        lookup[str(nat_id)] = {
-            "codigo": (nat.get("codigo") or "").strip(),
-            "descricao": (nat.get("descricao") or "").strip(),
-        }
-    return lookup
+def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
+    """Transforma os payloads da API no DataFrame final enriquecido."""
 
-
-# -------------------------------------------------------------
-# Carregamento + achatamento do JSON de chamadas
-# -------------------------------------------------------------
-@st.cache_data(show_spinner="Carregando chamadas ativas…")
-def carregar_dados(caminho_chamadas: str, caminho_naturezas: str):
     # 1) Catálogo de naturezas
-    with open(caminho_naturezas, "r", encoding="utf-8") as f:
-        nat_payload = json.load(f)
-    naturezas_lookup: dict = {}
-    for nat in nat_payload.get("dados", {}).get("value", []):
+    naturezas_lookup = {}
+    for nat in payload_naturezas.get("dados", {}).get("value", []):
         nat_id = nat.get("id")
         if nat_id is None:
             continue
@@ -325,14 +377,10 @@ def carregar_dados(caminho_chamadas: str, caminho_naturezas: str):
             "descricao": (nat.get("descricao") or "").strip(),
         }
 
-    # 2) Chamadas ativas
-    with open(caminho_chamadas, "r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    atualizado_em = payload.get("atualizado_em")
-    total_api = payload.get("total")
-
-    chamadas = _achar_lista_chamadas(payload)
+    # 2) Chamadas
+    atualizado_em = payload_chamadas.get("atualizado_em")
+    total_api = payload_chamadas.get("total")
+    chamadas = _achar_lista_chamadas(payload_chamadas)
 
     registros = []
     for ch in chamadas:
@@ -368,7 +416,6 @@ def carregar_dados(caminho_chamadas: str, caminho_naturezas: str):
 
         solicitante = ch.get("solicitanteChamada") or {}
 
-        # ---- Enriquecimento com o catálogo de naturezas ----
         nat_principal_id = nat0.get("idNatureza")
         nat_principal_id_str = str(nat_principal_id) if nat_principal_id else None
         nat_info = naturezas_lookup.get(nat_principal_id_str, {}) if nat_principal_id_str else {}
@@ -437,13 +484,6 @@ def carregar_dados(caminho_chamadas: str, caminho_naturezas: str):
             df[col] = pd.Series(dtype="object")
     df = df[COLUNAS_FINAIS]
 
-    print(
-        f"[carregar_dados] chamadas={len(chamadas)} | "
-        f"registros={len(df)} | "
-        f"naturezas_catalogo={len(naturezas_lookup)} | "
-        f"atualizado_em={atualizado_em} | total_api={total_api}"
-    )
-
     df["natureza_tipo_servico_desc"] = (
         df["natureza_tipo_servico"].map(TIPO_SERVICO).fillna("—")
     )
@@ -465,7 +505,6 @@ RE_CIA_IND = re.compile(r"^\s*\d+\s*CIA\s*IND\b", re.IGNORECASE)
 
 
 def classificar_tipo_unidade(nome: str) -> str:
-    """Classifica um nome de unidade em COB, BBM, CIA IND ou Outros."""
     if not isinstance(nome, str) or not nome.strip():
         return "Outros"
     n = nome.strip()
@@ -478,28 +517,20 @@ def classificar_tipo_unidade(nome: str) -> str:
     return "Outros"
 
 
-@st.cache_data(show_spinner="Carregando unidades…")
-def carregar_unidade_lookup(caminho: str) -> dict:
-    df = pd.read_csv(caminho, dtype=str, keep_default_na=False)
-
-    for col in ["unidade_id", "unidade_principal_id", "unidade_direcao_id"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-    for col in ["nome_unidade", "unidade_principal_nome", "unidade_direcao_nome"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-
-    lookup: dict = {}
-    for _, row in df.iterrows():
-        uid = row.get("unidade_id", "")
-        if not uid or uid.lower() == "nan":
+@st.cache_data(show_spinner="Processando unidades…")
+def processar_unidades(payload_unidades: dict) -> dict:
+    """Converte o JSON de unidades em lookup (mesma lógica do CSV original)."""
+    itens = payload_unidades.get("dados", {}).get("value", [])
+    lookup = {}
+    for row in itens:
+        uid = row.get("id")
+        if not uid:
             continue
-
-        nome = row.get("nome_unidade", "") or ""
+        nome = row.get("nome") or ""
         tipo = classificar_tipo_unidade(nome)
 
-        dir_nome = row.get("unidade_direcao_nome", "") or ""
-        dir_id = row.get("unidade_direcao_id", "") or ""
+        dir_nome = row.get("unidadeDirecaoNome") or ""
+        dir_id = row.get("unidadeDirecaoId") or ""
         if classificar_tipo_unidade(dir_nome) == "COB":
             cob_id, cob_nome = dir_id, dir_nome
         elif tipo == "COB":
@@ -507,8 +538,8 @@ def carregar_unidade_lookup(caminho: str) -> dict:
         else:
             cob_id, cob_nome = None, None
 
-        princ_nome = row.get("unidade_principal_nome", "") or ""
-        princ_id = row.get("unidade_principal_id", "") or ""
+        princ_nome = row.get("unidadePrincipalNome") or ""
+        princ_id = row.get("unidadePrincipalId") or ""
         tipo_princ = classificar_tipo_unidade(princ_nome)
 
         if tipo_princ == "BBM":
@@ -525,19 +556,17 @@ def carregar_unidade_lookup(caminho: str) -> dict:
         else:
             cia_id, cia_nome = None, None
 
-        lookup[uid] = {
+        lookup[str(uid)] = {
             "nome": nome,
             "tipo": tipo,
             "cob_id": cob_id, "cob_nome": cob_nome,
             "bbm_id": bbm_id, "bbm_nome": bbm_nome,
             "cia_ind_id": cia_id, "cia_ind_nome": cia_nome,
         }
-
     return lookup
 
 
 def enriquecer_com_unidades(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
-    """Adiciona colunas de unidade (nome, tipo e hierarquia COB/BBM/CIA IND)."""
     if not lookup:
         for c in ["unidade_nome", "unidade_tipo",
                   "cob_id", "cob_nome",
@@ -561,52 +590,39 @@ def enriquecer_com_unidades(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
 
 
 # -------------------------------------------------------------
-# Validação de arquivos
+# Validação e carga dos dados
 # -------------------------------------------------------------
-if not CAMINHO_JSON.exists() or not CAMINHO_NATUREZAS.exists():
-    st.warning(
-        "Arquivos de dados não foram encontrados em `data/` nem na raiz do projeto. "
-        "O dashboard será exibido em modo vazio para evitar falha no deploy. "
-        "Configure a variável de ambiente `DATA_DIR` ou adicione os arquivos esperados."
-    )
-    df = pd.DataFrame(columns=COLUNAS_FINAIS)
-    atualizado_em = "N/D"
-    total_api = 0
-    unidade_lookup = {}
-    tem_unidades = False
-    df = enriquecer_com_unidades(df, {})
-    st.info(
-        "Arquivos esperados: `Chamadas_Ativas.json`, `naturezas.json` e `unidade.csv`. "
-        "Quando esses arquivos estiverem disponíveis, o painel será preenchido automaticamente."
-    )
+try:
+    payload_chamadas = buscar_chamadas_api()
+    payload_naturezas = buscar_naturezas_api()
+    payload_unidades = buscar_unidades_api()
+except TokenInvalido as exc:
+    st.error(f"🔐 {exc}")
+    st.stop()
+except ConjuntoAusente as exc:
+    st.warning(f"⚠️ {exc}")
+    st.stop()
+except Exception as exc:
+    st.error(f"❌ Erro ao consultar a API: {exc}")
     st.stop()
 
-# -------------------------------------------------------------
-# Carga dos dados
-# -------------------------------------------------------------
-df, atualizado_em, total_api = carregar_dados(
-    str(CAMINHO_JSON), str(CAMINHO_NATUREZAS)
-)
+df, atualizado_em, total_api = processar_dados(payload_chamadas, payload_naturezas)
 
-if CAMINHO_UNIDADES.exists():
-    unidade_lookup = carregar_unidade_lookup(str(CAMINHO_UNIDADES))
-    df = enriquecer_com_unidades(df, unidade_lookup)
-    tem_unidades = True
-else:
-    unidade_lookup = {}
-    df = enriquecer_com_unidades(df, {})
-    tem_unidades = False
-    st.warning(
-        f"Arquivo `{CAMINHO_UNIDADES.name}` não encontrado — "
-        "filtros por COB / BBM / CIA IND ficam desabilitados."
-    )
+unidade_lookup = processar_unidades(payload_unidades) if payload_unidades else {}
+df = enriquecer_com_unidades(df, unidade_lookup)
+tem_unidades = bool(unidade_lookup)
 
 # -------------------------------------------------------------
-# Sidebar — cabeçalho + filtro de UNIDADE (apenas)
+# Sidebar — cabeçalho + filtro de UNIDADE + botão de atualização
 # -------------------------------------------------------------
 st.sidebar.title("🚒 CBMMG — Chamadas Ativas")
 st.sidebar.caption(f"Atualizado em: **{atualizado_em}**")
 st.sidebar.caption(f"Total reportado pela API: **{total_api}**")
+
+# Botão “Atualizar agora”
+if st.sidebar.button("🔄 Atualizar agora", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
 
 f_cob: list = []
 f_bbm: list = []
@@ -665,7 +681,7 @@ if tem_unidades:
                 f"CIA IND: {len(f_cia) or 'todas'}"
             )
 else:
-    st.sidebar.info("Filtro por unidade indisponível (CSV ausente).")
+    st.sidebar.info("Filtro por unidade indisponível (dados de unidades não carregados).")
 
 # -------------------------------------------------------------
 # Aplicação do filtro de unidade
@@ -684,7 +700,7 @@ st.sidebar.markdown(f"**Chamadas após filtros:** `{len(df_filt)}`")
 
 
 # =============================================================
-# CABEÇALHO DE DESTAQUE (título + subtítulo)
+# CABEÇALHO DE DESTAQUE
 # =============================================================
 st.markdown("""
     <div class="cbmmg-header">
@@ -714,7 +730,6 @@ total_ativas = len(df_filt)
 total_em_atend = int((df_filt["situacao_codigo"] == "E").sum())
 total_aguard = int((df_filt["situacao_codigo"] == "A").sum())
 
-# Equipes empenhadas — usa idRecursoPrincipal; se ausente, cai para a unidade
 campo_recurso = "idRecursoPrincipal"
 if df_filt["idRecursoPrincipal"].notna().sum() == 0:
     campo_recurso = "idUnidadeServicoResponsavel"
@@ -789,7 +804,6 @@ with aba_mapa:
             .map(CORES_ATENDIMENTO).fillna("#cccccc")
         )
 
-        # Mapa centralizado em Minas Gerais
         centro_mg = [-18.5, -44.5]
         mapa = folium.Map(
             location=centro_mg,
@@ -835,7 +849,6 @@ with aba_mapa:
 
         st_folium(mapa, width=None, height=680, returned_objects=[])
 
-        # ---- LEGENDA abaixo do mapa ----
         st.markdown(
             '<div class="legenda-titulo">Legenda — Situação do Atendimento</div>',
             unsafe_allow_html=True,
@@ -853,7 +866,6 @@ with aba_mapa:
             unsafe_allow_html=True,
         )
 
-        # ---- Tabela de pontos plotados ----
         st.markdown("#### Pontos plotados")
         cols_mapa = [
             "numeroChamada", "situacao", "situacao_atendimento_principal_desc",
@@ -876,7 +888,6 @@ with aba_indicadores:
 
     col_a, col_b = st.columns(2)
 
-    # ---- Chamadas por Natureza ----
     with col_a:
         st.markdown("#### Chamadas ativas por natureza (DIAO / ITO 25)")
         nat_count = (
@@ -916,7 +927,6 @@ with aba_indicadores:
             with st.expander("Ver tabela completa"):
                 st.dataframe(nat_count, use_container_width=True, hide_index=True)
 
-    # ---- Chamadas por Status ----
     with col_b:
         st.markdown("#### Chamadas ativas por status")
 
@@ -951,7 +961,6 @@ with aba_indicadores:
 
     st.divider()
 
-    # ---- Origem / Prioridade / Tipo de serviço ----
     col_c, col_d, col_e = st.columns(3)
 
     with col_c:
@@ -992,7 +1001,6 @@ with aba_indicadores:
         fig_tipo.update_layout(showlegend=False, height=340, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_tipo, use_container_width=True)
 
-    # ---- Distribuição por unidade (top N) ----
     if tem_unidades and not df_filt.empty:
         st.divider()
         st.markdown("#### Chamadas por unidade responsável (top 15)")
@@ -1012,7 +1020,6 @@ with aba_indicadores:
         )
         st.plotly_chart(fig_unid, use_container_width=True)
 
-    # ---- Evolução temporal ----
     st.divider()
     st.markdown("#### Evolução das aberturas (hora)")
     df_temp = df_filt.dropna(subset=["dataHoraInclusao"]).copy()
@@ -1023,7 +1030,6 @@ with aba_indicadores:
         fig_serie.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_serie, use_container_width=True)
 
-    # ---- Tabela detalhada ----
     st.divider()
     st.markdown("#### Detalhamento")
     colunas_exib = [
@@ -1067,8 +1073,8 @@ with aba_indicadores:
 # -------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Dashboard operacional · Fonte: dump JSON do CAD / CBMMG · "
+    "Dashboard operacional · Fonte: API CAD / CBMMG · "
     "Catálogo de naturezas: DIAO / ITO 25 · "
-    "Cadastro de unidades: unidade.csv · "
+    "Cadastro de unidades: API de unidades · "
     "Desenvolvido para o COBOM-BH."
 )
