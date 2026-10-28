@@ -199,7 +199,7 @@ if not TOKEN:
     )
     st.stop()
 
-BASE_URL = "https://apicadbm.bombeiros.mg.gov.br"
+BASE_URL = "https://cbmmg-api-proxy.pesmesquita.workers.dev"
 
 # Intervalos (segundos)
 INTERVALO_MINIMO_ENTRE_CHAMADAS = 5
