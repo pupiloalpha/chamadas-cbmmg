@@ -10,6 +10,8 @@ dependencies = [
     "plotly>=5.0",
     "folium>=0.19",
     "streamlit-folium>=0.22",
+    "requests>=2.31.0",
+    "streamlit-autorefresh>=0.1.0",
 ]
 
 [tool.uv]
