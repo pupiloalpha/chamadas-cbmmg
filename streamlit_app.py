@@ -225,21 +225,36 @@ class ConjuntoAusente(Exception):
 
 
 def _chamar_api(rota: str) -> dict:
-    """Faz uma chamada à API respeitando o intervalo mínimo de 5 s e tratando erros."""
+    """Faz uma chamada à API com timeout maior e retry com backoff."""
     global _ultima_chamada
 
-    for tentativa in range(3):
+    # Aumentamos o timeout para 60s para redes mais lentas
+    TIMEOUT_SEGUNDOS = 60 
+    
+    for tentativa in range(4):  # Aumentamos para 4 tentativas
         espera = INTERVALO_MINIMO_ENTRE_CHAMADAS - (time.monotonic() - _ultima_chamada)
         if espera > 0:
             time.sleep(espera)
 
         _ultima_chamada = time.monotonic()
+        
+        # Adicionamos um backoff exponencial para ser mais paciente
+        if tentativa > 0:
+            time.sleep(2 ** tentativa) 
+
         try:
-            resp = _sessao.get(BASE_URL + rota, timeout=30)
+            resp = _sessao.get(BASE_URL + rota, timeout=TIMEOUT_SEGUNDOS)
+        except requests.exceptions.ConnectTimeout:
+            # Se for a última tentativa, levanta o erro para o app tratar
+            if tentativa == 3:
+                raise RuntimeError(
+                    f"Não foi possível conectar a {BASE_URL}. "
+                    "Verifique se a API está acessível a partir do Streamlit Cloud."
+                )
+            continue # Tenta novamente
         except requests.RequestException as exc:
-            if tentativa == 2:
-                raise RuntimeError(f"Falha de rede em {rota}: {exc}")
-            time.sleep(10)
+            if tentativa == 3:
+                raise RuntimeError(f"Falha de rede persistente em {rota}: {exc}")
             continue
 
         if resp.status_code == 200:
