@@ -199,7 +199,7 @@ if not TOKEN:
     )
     st.stop()
 
-BASE_URL = "https://apicadbm.bombeiros.mg.gov.br/docs"
+BASE_URL = "https://apicadbm.bombeiros.mg.gov.br"
 
 # Intervalos (segundos)
 INTERVALO_MINIMO_ENTRE_CHAMADAS = 5
