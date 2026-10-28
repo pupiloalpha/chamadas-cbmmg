@@ -2,13 +2,24 @@
 # -------------------------------------------------------------
 # Dashboard CBMMG - Chamadas Ativas (COBOM-BH)
 # Fonte: API CAD (https://apicadbm.bombeiros.mg.gov.br)
-#        naturezas.json (catálogo DIAO / ITO 25)  → via API
-#        unidade.csv (cadastro de unidades)        → via API
+#
+# CORREÇÕES APLICADAS (2026-10):
+#   1) Parser do envelope documentado no manual: `dados` já é a lista.
+#   2) Auxiliares (/dados-auxiliares/*) aceitam `dados` como lista OU dict{"value": [...]}.
+#   3) Lock + timestamp compartilhados via @st.cache_resource → respeita 5 s entre QUAISQUER chamadas,
+#      mesmo com múltiplas sessões do Streamlit Cloud.
+#   4) Sessão requests também cacheada como resource.
+#   5) Headers Authorization + X-API-Key + User-Agent + Accept.
+#   6) Painel de diagnóstico (GET / e GET /status) acionável por checkbox.
+#   7) Botão "Atualizar agora" limpa cache_data E cache_resource.
+#   8) Autorefresh 12 min com TTL 10 min → sempre busca dado novo, sem rajada.
+#   9) Slider de naturezas protegido contra poucas categorias.
+#  10) Mensagens de erro com status HTTP e trecho do corpo.
 # -------------------------------------------------------------
 
-import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -30,10 +41,10 @@ st.set_page_config(
     layout="wide",
 )
 
-# ---- Autorefresh a cada 10 minutos ----
-st_autorefresh(interval=10 * 60 * 1000, key="data_refresh")
+# Autorefresh: 12 min (sempre acima do TTL de 10 min → dado novo a cada ciclo)
+st_autorefresh(interval=12 * 60 * 1000, key="data_refresh")
 
-# ---- Detecção do tema ativo (light / dark) ----
+# Tema
 try:
     TEMA_BASE = (st.get_option("theme.base") or "light").lower()
 except Exception:
@@ -42,11 +53,10 @@ except Exception:
 TEMA_ESCURO = (TEMA_BASE == "dark")
 
 # -------------------------------------------------------------
-# Estilos customizados (cabeçalho, cards, legenda)
+# Estilos customizados
 # -------------------------------------------------------------
 st.markdown("""
     <style>
-    /* ---- Cabeçalho principal ---- */
     .cbmmg-header {
         background: linear-gradient(135deg, #B71C1C 0%, #7F0000 100%);
         padding: 26px 22px;
@@ -72,7 +82,6 @@ st.markdown("""
         font-style: italic;
         margin: 12px 0 26px 0;
     }
-    /* ---- Cards de KPI ---- */
     .metric-card {
         border-radius: 14px;
         padding: 20px 16px;
@@ -101,7 +110,6 @@ st.markdown("""
         opacity: 0.96;
         font-weight: 700;
     }
-    /* ---- Legenda do mapa (theme-aware) ---- */
     .legenda-titulo {
         text-align: center;
         font-size: 14px;
@@ -182,39 +190,37 @@ TIPO_SERVICO = {
 }
 
 # -------------------------------------------------------------
-# Caminhos e configuração da API
+# Configuração da API
 # -------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 
-# Token: lê de st.secrets ou variável de ambiente
+# Token: st.secrets (Streamlit Cloud) OU variável de ambiente (local)
+TOKEN = None
 try:
     TOKEN = st.secrets["CBM_API_TOKEN"]
 except (KeyError, FileNotFoundError):
+    TOKEN = os.environ.get("CBM_API_TOKEN")
+except Exception:
     TOKEN = os.environ.get("CBM_API_TOKEN")
 
 if not TOKEN:
     st.error(
         "❌ Token da API não configurado. "
-        "Defina `CBM_API_TOKEN` em `.streamlit/secrets.toml` ou como variável de ambiente."
+        "No Streamlit Cloud, defina `CBM_API_TOKEN` em **Settings → Secrets**. "
+        "Localmente, crie `.streamlit/secrets.toml` ou exporte a variável."
     )
     st.stop()
 
 BASE_URL = "https://apicadbm.bombeiros.mg.gov.br"
 
-# Intervalos (segundos)
-INTERVALO_MINIMO_ENTRE_CHAMADAS = 5
-INTERVALO_OPERACAO = 30  # não usado diretamente, pois o cache cuida disso
-TTL_DADOS_OPERACIONAIS = 600  # 10 minutos
-TTL_CATALOGOS = 86400  # 24 horas (auxiliares)
-
-# Sessão HTTP com header de autenticação
-_sessao = requests.Session()
-_sessao.headers["Authorization"] = f"Bearer {TOKEN}"
-_ultima_chamada = 0.0
+INTERVALO_MINIMO_ENTRE_CHAMADAS = 5     # segundos (mínimo técnico por token)
+TTL_DADOS_OPERACIONAIS = 600            # 10 min — /ativos/chamadas
+TTL_CATALOGOS = 86400                   # 24 h — auxiliares
+TIMEOUT_HTTP = 30                       # segundos por requisição
 
 
 # -------------------------------------------------------------
-# Funções de API
+# Exceções
 # -------------------------------------------------------------
 class TokenInvalido(Exception):
     pass
@@ -224,77 +230,128 @@ class ConjuntoAusente(Exception):
     pass
 
 
+# -------------------------------------------------------------
+# Recursos compartilhados entre sessões (sessão HTTP, lock, timestamp)
+# -------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def _api_runtime():
+    sessao = requests.Session()
+    sessao.headers["Authorization"] = f"Bearer {TOKEN}"
+    sessao.headers["X-API-Key"] = TOKEN
+    sessao.headers["User-Agent"] = "CBMMG-Dashboard/0.1 (+streamlit-cloud)"
+    sessao.headers["Accept"] = "application/json"
+    return {
+        "sessao": sessao,
+        "lock": threading.Lock(),
+        "ultima": 0.0,
+    }
+
+
+# -------------------------------------------------------------
+# Chamada à API — com lock e espaçamento entre QUAISQUER chamadas
+# -------------------------------------------------------------
 def _chamar_api(rota: str) -> dict:
-    """Faz uma chamada à API com timeout maior e retry com backoff."""
-    global _ultima_chamada
+    rt = _api_runtime()
+    lock = rt["lock"]
+    sessao = rt["sessao"]
 
-    # Aumentamos o timeout para 60s para redes mais lentas
-    TIMEOUT_SEGUNDOS = 60 
-    
-    for tentativa in range(4):  # Aumentamos para 4 tentativas
-        espera = INTERVALO_MINIMO_ENTRE_CHAMADAS - (time.monotonic() - _ultima_chamada)
-        if espera > 0:
-            time.sleep(espera)
+    # Segura o lock durante toda a tentativa → garante 5 s entre o FIM de
+    # uma chamada e o INÍCIO da próxima, mesmo com múltiplas sessões.
+    with lock:
+        for tentativa in range(4):
+            espera = INTERVALO_MINIMO_ENTRE_CHAMADAS - (time.monotonic() - rt["ultima"])
+            if espera > 0:
+                time.sleep(espera)
+            if tentativa > 0:
+                time.sleep(2 ** tentativa)  # backoff exponencial (2, 4, 8 s)
+            rt["ultima"] = time.monotonic()
 
-        _ultima_chamada = time.monotonic()
-        
-        # Adicionamos um backoff exponencial para ser mais paciente
-        if tentativa > 0:
-            time.sleep(2 ** tentativa) 
+            try:
+                resp = sessao.get(BASE_URL + rota, timeout=TIMEOUT_HTTP)
+            except requests.exceptions.ConnectTimeout:
+                if tentativa == 3:
+                    raise RuntimeError(
+                        f"Timeout ao conectar em {BASE_URL}. "
+                        "Verifique se a API está acessível a partir do Streamlit Cloud."
+                    )
+                continue
+            except requests.RequestException as exc:
+                if tentativa == 3:
+                    raise RuntimeError(f"Falha de rede em {rota}: {exc!r}")
+                continue
 
-        try:
-            resp = _sessao.get(BASE_URL + rota, timeout=TIMEOUT_SEGUNDOS)
-        except requests.exceptions.ConnectTimeout:
-            # Se for a última tentativa, levanta o erro para o app tratar
-            if tentativa == 3:
-                raise RuntimeError(
-                    f"Não foi possível conectar a {BASE_URL}. "
-                    "Verifique se a API está acessível a partir do Streamlit Cloud."
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code == 401:
+                raise TokenInvalido(
+                    "401 — Credencial inválida. O token está ausente, errado ou foi revogado."
                 )
-            continue # Tenta novamente
-        except requests.RequestException as exc:
-            if tentativa == 3:
-                raise RuntimeError(f"Falha de rede persistente em {rota}: {exc}")
-            continue
+            if resp.status_code == 404:
+                raise ConjuntoAusente(
+                    f"404 — Conjunto {rota} ainda não foi gravado na API. "
+                    "Avise o responsável pela API."
+                )
+            if resp.status_code == 429:
+                retry = float(resp.headers.get("Retry-After", 30) or 30)
+                time.sleep(max(retry, INTERVALO_MINIMO_ENTRE_CHAMADAS))
+                continue
+            if resp.status_code == 503:
+                time.sleep(120)
+                continue
+            raise RuntimeError(
+                f"{rota}: HTTP {resp.status_code} — {resp.text[:200]}"
+            )
 
-        if resp.status_code == 200:
-            return resp.json()
-        if resp.status_code == 401:
-            raise TokenInvalido("Credencial inválida. Verifique o token da API.")
-        if resp.status_code == 404:
-            raise ConjuntoAusente(f"Conjunto {rota} ainda não foi gravado na API.")
-        if resp.status_code == 429:
-            retry = float(resp.headers.get("Retry-After", 30))
-            time.sleep(max(retry, INTERVALO_MINIMO_ENTRE_CHAMADAS))
-            continue
-        if resp.status_code == 503:
-            time.sleep(120)
-            continue
-        resp.raise_for_status()
-
-    raise RuntimeError(f"{rota}: sem resposta válida após tentativas espaçadas.")
+    raise RuntimeError(f"{rota}: sem resposta válida após 4 tentativas espaçadas.")
 
 
+# -------------------------------------------------------------
+# Endpoints cacheados
+# -------------------------------------------------------------
 @st.cache_data(ttl=TTL_DADOS_OPERACIONAIS, show_spinner="Carregando chamadas ativas da API…")
 def buscar_chamadas_api() -> dict:
-    """Busca o payload de /ativos/chamadas (com cache de 10 min)."""
     return _chamar_api("/ativos/chamadas")
 
 
 @st.cache_data(ttl=TTL_CATALOGOS, show_spinner="Carregando naturezas…")
 def buscar_naturezas_api() -> dict:
-    """Busca o catálogo de naturezas (cache de 24 h)."""
     return _chamar_api("/dados-auxiliares/naturezas")
 
 
 @st.cache_data(ttl=TTL_CATALOGOS, show_spinner="Carregando unidades…")
 def buscar_unidades_api() -> dict:
-    """Busca o cadastro de unidades (cache de 24 h)."""
     return _chamar_api("/dados-auxiliares/unidades-servico")
 
 
+@st.cache_data(ttl=300, show_spinner="Rodando diagnóstico de conectividade…")
+def checar_saude() -> dict:
+    """Diagnóstico: GET / (sem token) e GET /status (com token)."""
+    info = {}
+    try:
+        r = requests.get(BASE_URL + "/", timeout=15)
+        info["raiz_status"] = r.status_code
+        info["raiz_ok"] = r.ok
+    except Exception as exc:
+        info["raiz_erro"] = repr(exc)
+
+    try:
+        info["status_body"] = _chamar_api("/status")
+        info["status_ok"] = True
+    except TokenInvalido as exc:
+        info["status_ok"] = False
+        info["status_erro"] = f"401 — {exc}"
+    except ConjuntoAusente as exc:
+        info["status_ok"] = False
+        info["status_erro"] = f"404 — {exc}"
+    except Exception as exc:
+        info["status_ok"] = False
+        info["status_erro"] = repr(exc)
+
+    return info
+
+
 # -------------------------------------------------------------
-# Utilidades genéricas (mantidas do código original)
+# Utilitários genéricos
 # -------------------------------------------------------------
 def to_list(x):
     if x is None:
@@ -328,14 +385,28 @@ def safe_float(value):
 
 
 def _achar_lista_chamadas(payload: dict):
-    """Localiza a lista de chamadas independentemente do aninhamento."""
-    candidatos = [
-        ("dados", "response", "dadosVigentesChamadas", "dadosVigentesChamadaV1"),
-        ("dados", "response", "dadosVigentesChamadaV1"),
+    """Localiza a lista de chamadas independentemente do formato do envelope."""
+    if not isinstance(payload, dict):
+        return []
+
+    dados = payload.get("dados")
+
+    # 1) Envelope documentado: `dados` já é a lista
+    if isinstance(dados, list):
+        return dados
+
+    # 2) `/ativos` agrega por categoria
+    if isinstance(dados, dict):
+        for chave in ("chamadas", "ativas", "itens", "value", "dadosVigentesChamadaV1"):
+            node = dados.get(chave)
+            if isinstance(node, list):
+                return node
+
+    # 3) Formato legado
+    for caminho in (
         ("response", "dadosVigentesChamadas", "dadosVigentesChamadaV1"),
         ("response", "dadosVigentesChamadaV1"),
-    ]
-    for caminho in candidatos:
+    ):
         node = payload
         ok = True
         for chave in caminho:
@@ -344,16 +415,44 @@ def _achar_lista_chamadas(payload: dict):
             else:
                 ok = False
                 break
-        if ok and node is not None:
+        if ok and isinstance(node, list):
+            return node
+
+    return []
+
+
+def _achar_lista_auxiliar(payload: dict):
+    """Lista de /dados-auxiliares/* e /codigos: aceita lista ou dict com 'value'."""
+    if not isinstance(payload, dict):
+        return []
+
+    dados = payload.get("dados")
+    if isinstance(dados, list):
+        return dados
+    if isinstance(dados, dict):
+        for chave in ("value", "itens", "lista"):
+            node = dados.get(chave)
             if isinstance(node, list):
                 return node
-            if isinstance(node, dict):
-                return [node]
+    return []
+
+
+def _list_from_chamada(ch: dict, wrapper_key: str, inner_key: str):
+    """Extrai uma lista de chamada, aceitando dict-wrapper ou lista direta."""
+    node = ch.get(wrapper_key)
+    if isinstance(node, list):
+        return node
+    if isinstance(node, dict):
+        inner = node.get(inner_key)
+        if isinstance(inner, list):
+            return inner
+        if isinstance(inner, dict):
+            return [inner]
     return []
 
 
 # -------------------------------------------------------------
-# Colunas garantidas do DataFrame final
+# Colunas garantidas do DataFrame
 # -------------------------------------------------------------
 COLUNAS_FINAIS = [
     "id", "numeroChamada", "origem_codigo", "origem",
@@ -375,15 +474,13 @@ COLUNAS_FINAIS = [
 
 
 # -------------------------------------------------------------
-# Processamento dos dados (adaptado para receber payload da API)
+# Processamento dos dados
 # -------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
-    """Transforma os payloads da API no DataFrame final enriquecido."""
-
     # 1) Catálogo de naturezas
     naturezas_lookup = {}
-    for nat in payload_naturezas.get("dados", {}).get("value", []):
+    for nat in _achar_lista_auxiliar(payload_naturezas):
         nat_id = nat.get("id")
         if nat_id is None:
             continue
@@ -393,27 +490,26 @@ def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
         }
 
     # 2) Chamadas
-    atualizado_em = payload_chamadas.get("atualizado_em")
-    total_api = payload_chamadas.get("total")
+    atualizado_em = payload_chamadas.get("atualizado_em") if isinstance(payload_chamadas, dict) else None
+    total_api = payload_chamadas.get("total") if isinstance(payload_chamadas, dict) else None
     chamadas = _achar_lista_chamadas(payload_chamadas)
 
     registros = []
     for ch in chamadas:
-        atendimentos = to_list(
-            ch.get("dadosVigentesAtendimentosChamada", {})
-              .get("dadosVigentesAtendimentoChamadaV1")
+        if not isinstance(ch, dict):
+            continue
+
+        atendimentos = _list_from_chamada(
+            ch, "dadosVigentesAtendimentosChamada", "dadosVigentesAtendimentoChamadaV1"
         )
-        naturezas = to_list(
-            ch.get("dadosVigentesNaturezasChamada", {})
-              .get("dadosVigentesNaturezaChamadaV1")
+        naturezas = _list_from_chamada(
+            ch, "dadosVigentesNaturezasChamada", "dadosVigentesNaturezaChamadaV1"
         )
-        historicos = to_list(
-            ch.get("dadosVigentesHistoricosChamada", {})
-              .get("dadosVigentesHistoricoChamadaV1")
+        historicos = _list_from_chamada(
+            ch, "dadosVigentesHistoricosChamada", "dadosVigentesHistoricoChamadaV1"
         )
-        envolvidos = to_list(
-            ch.get("dadosVigentesEnvolvidosChamada", {})
-              .get("dadosVigentesEnvolvidoChamadaV1")
+        envolvidos = _list_from_chamada(
+            ch, "dadosVigentesEnvolvidosChamada", "dadosVigentesEnvolvidoChamadaV1"
         )
 
         nat0 = naturezas[0] if naturezas else {}
@@ -421,17 +517,29 @@ def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
         sits_atend = [
             a.get("codigoSituacaoAtendimentoChamada")
             for a in atendimentos
-            if a.get("codigoSituacaoAtendimentoChamada")
+            if isinstance(a, dict) and a.get("codigoSituacaoAtendimentoChamada")
         ]
-        nat_ids = [n.get("idNatureza") for n in naturezas if n.get("idNatureza")]
+
+        nat_ids = [
+            n.get("idNatureza") for n in naturezas
+            if isinstance(n, dict) and n.get("idNatureza")
+        ]
         nat_prioridades = sorted({
-            n.get("codigoPrioridade") for n in naturezas if n.get("codigoPrioridade")
+            str(n.get("codigoPrioridade"))
+            for n in naturezas
+            if isinstance(n, dict) and n.get("codigoPrioridade") is not None
         })
-        nat_tipos = {n.get("codigoTipoServico") for n in naturezas if n.get("codigoTipoServico")}
+        nat_tipos = {
+            n.get("codigoTipoServico")
+            for n in naturezas
+            if isinstance(n, dict) and n.get("codigoTipoServico")
+        }
 
         solicitante = ch.get("solicitanteChamada") or {}
+        if not isinstance(solicitante, dict):
+            solicitante = {}
 
-        nat_principal_id = nat0.get("idNatureza")
+        nat_principal_id = nat0.get("idNatureza") if isinstance(nat0, dict) else None
         nat_principal_id_str = str(nat_principal_id) if nat_principal_id else None
         nat_info = naturezas_lookup.get(nat_principal_id_str, {}) if nat_principal_id_str else {}
         nat_codigo = nat_info.get("codigo", "")
@@ -447,6 +555,10 @@ def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
         else:
             nat_label = "—"
 
+        a0 = atendimentos[0] if atendimentos else {}
+        if not isinstance(a0, dict):
+            a0 = {}
+
         registros.append({
             "id": ch.get("id"),
             "numeroChamada": ch.get("numeroChamada"),
@@ -461,22 +573,18 @@ def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
             "referenciaLocalFato": ch.get("referenciaLocalFato"),
             "estabelecimentoLocalFato": ch.get("estabelecimentoLocalFato"),
             "nomeUsuarioInclusao": ch.get("nomeUsuarioInclusao"),
-            "idOrgao": (atendimentos[0].get("idOrgao") if atendimentos else None),
-            "idUnidadeServicoResponsavel": (
-                atendimentos[0].get("idUnidadeServicoResponsavel") if atendimentos else None
-            ),
-            "idRecursoPrincipal": (
-                atendimentos[0].get("idRecursoPrincipal") if atendimentos else None
-            ),
-            "alerta": (atendimentos[0].get("alerta") if atendimentos else None),
-            "destaque": (atendimentos[0].get("destaque") if atendimentos else None),
-            "envolveAutoridade": (atendimentos[0].get("envolveAutoridade") if atendimentos else None),
+            "idOrgao": a0.get("idOrgao"),
+            "idUnidadeServicoResponsavel": a0.get("idUnidadeServicoResponsavel"),
+            "idRecursoPrincipal": a0.get("idRecursoPrincipal"),
+            "alerta": a0.get("alerta"),
+            "destaque": a0.get("destaque"),
+            "envolveAutoridade": a0.get("envolveAutoridade"),
             "natureza_id": nat_principal_id,
             "natureza_codigo": nat_codigo,
             "natureza_descricao": nat_descricao,
             "natureza_label": nat_label,
-            "natureza_prioridade": nat0.get("codigoPrioridade"),
-            "natureza_tipo_servico": nat0.get("codigoTipoServico"),
+            "natureza_prioridade": nat0.get("codigoPrioridade") if isinstance(nat0, dict) else None,
+            "natureza_tipo_servico": nat0.get("codigoTipoServico") if isinstance(nat0, dict) else None,
             "naturezas_ids": ",".join(str(x) for x in nat_ids),
             "naturezas_prioridades": ",".join(nat_prioridades),
             "naturezas_tipos_servico": ",".join(sorted(nat_tipos)),
@@ -503,7 +611,7 @@ def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
         df["natureza_tipo_servico"].map(TIPO_SERVICO).fillna("—")
     )
     df["prioridade_desc"] = (
-        df["natureza_prioridade"]
+        df["natureza_prioridade"].astype(str)
         .map({"1": "1 - Alta", "2": "2 - Média", "3": "3 - Baixa"})
         .fillna("—")
     )
@@ -512,7 +620,7 @@ def processar_dados(payload_chamadas: dict, payload_naturezas: dict):
 
 
 # =============================================================
-# UNIDADES — carregamento e classificação (COB / BBM / CIA IND)
+# UNIDADES — classificação COB / BBM / CIA IND
 # =============================================================
 RE_COB = re.compile(r"^\s*\d+\s*COB\b", re.IGNORECASE)
 RE_BBM = re.compile(r"^\s*\d+\s*BBM\b", re.IGNORECASE)
@@ -534,10 +642,11 @@ def classificar_tipo_unidade(nome: str) -> str:
 
 @st.cache_data(show_spinner="Processando unidades…")
 def processar_unidades(payload_unidades: dict) -> dict:
-    """Converte o JSON de unidades em lookup (mesma lógica do CSV original)."""
-    itens = payload_unidades.get("dados", {}).get("value", [])
+    itens = _achar_lista_auxiliar(payload_unidades)
     lookup = {}
     for row in itens:
+        if not isinstance(row, dict):
+            continue
         uid = row.get("id")
         if not uid:
             continue
@@ -605,7 +714,28 @@ def enriquecer_com_unidades(df: pd.DataFrame, lookup: dict) -> pd.DataFrame:
 
 
 # -------------------------------------------------------------
-# Validação e carga dos dados
+# Sidebar (topo) — título, timestamp, botões, diagnóstico
+# -------------------------------------------------------------
+st.sidebar.title("🚒 CBMMG — Chamadas Ativas")
+
+if st.sidebar.button("🔄 Atualizar agora", use_container_width=True):
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.rerun()
+
+with st.sidebar.expander("🩺 Diagnóstico de conectividade", expanded=False):
+    st.caption(
+        "Use se os dados não aparecerem. Bate em `GET /` (sem token) e `GET /status`."
+    )
+    if st.checkbox("Rodar diagnóstico", value=False, key="run_diag"):
+        diag = checar_saude()
+        st.json(diag)
+        st.caption("Se `raiz_erro` aparecer, é bloqueio de rede/geo. "
+                   "Se `status_erro` mostrar 401, o token está errado nos Secrets.")
+
+
+# -------------------------------------------------------------
+# Carga dos dados
 # -------------------------------------------------------------
 try:
     payload_chamadas = buscar_chamadas_api()
@@ -613,32 +743,43 @@ try:
     payload_unidades = buscar_unidades_api()
 except TokenInvalido as exc:
     st.error(f"🔐 {exc}")
+    st.info(
+        "Confirme que o token está em **Settings → Secrets** do Streamlit Cloud, "
+        "no formato `CBM_API_TOKEN = \"cbm_live_...\"`."
+    )
     st.stop()
 except ConjuntoAusente as exc:
     st.warning(f"⚠️ {exc}")
     st.stop()
 except Exception as exc:
-    st.error(f"❌ Erro ao consultar a API: {exc}")
+    st.error(f"❌ Erro ao consultar a API: {exc!r}")
+    st.info("Ative o diagnóstico na barra lateral para investigar.")
     st.stop()
 
-df, atualizado_em, total_api = processar_dados(payload_chamadas, payload_naturezas)
+# Contagens brutas (para diagnóstico)
+n_chamadas_raw = len(_achar_lista_chamadas(payload_chamadas))
+n_naturezas_raw = len(_achar_lista_auxiliar(payload_naturezas))
+n_unidades_raw = len(_achar_lista_auxiliar(payload_unidades))
 
+df, atualizado_em, total_api = processar_dados(payload_chamadas, payload_naturezas)
 unidade_lookup = processar_unidades(payload_unidades) if payload_unidades else {}
 df = enriquecer_com_unidades(df, unidade_lookup)
 tem_unidades = bool(unidade_lookup)
 
-# -------------------------------------------------------------
-# Sidebar — cabeçalho + filtro de UNIDADE + botão de atualização
-# -------------------------------------------------------------
-st.sidebar.title("🚒 CBMMG — Chamadas Ativas")
+# Sidebar: info + diagnóstico resumido
 st.sidebar.caption(f"Atualizado em: **{atualizado_em}**")
 st.sidebar.caption(f"Total reportado pela API: **{total_api}**")
+st.sidebar.caption(
+    f"Registros parseados — chamadas: **{n_chamadas_raw}** · "
+    f"naturezas: **{n_naturezas_raw}** · unidades: **{n_unidades_raw}**"
+)
+if n_chamadas_raw == 0:
+    st.sidebar.warning(
+        "0 chamadas vieram da API. Isso normalmente significa que o envelope "
+        "mudou. Ative o diagnóstico acima e verifique o corpo de `/ativos/chamadas`."
+    )
 
-# Botão “Atualizar agora”
-if st.sidebar.button("🔄 Atualizar agora", use_container_width=True):
-    st.cache_data.clear()
-    st.rerun()
-
+# Filtros de unidade
 f_cob: list = []
 f_bbm: list = []
 f_cia: list = []
@@ -652,10 +793,7 @@ if tem_unidades:
         })
         f_cob = st.multiselect(
             "COB (Coordenadoria Operacional)",
-            options=cobs_disponiveis,
-            default=[],
-            placeholder="Todos",
-            key="f_cob",
+            options=cobs_disponiveis, default=[], placeholder="Todos", key="f_cob",
         )
 
         pool_bbm = list(unidade_lookup.values())
@@ -666,10 +804,7 @@ if tem_unidades:
         })
         f_bbm = st.multiselect(
             "BBM (Batalhão)",
-            options=bbms_disponiveis,
-            default=[],
-            placeholder="Todos",
-            key="f_bbm",
+            options=bbms_disponiveis, default=[], placeholder="Todos", key="f_bbm",
         )
 
         pool_cia = list(unidade_lookup.values())
@@ -682,10 +817,7 @@ if tem_unidades:
         })
         f_cia = st.multiselect(
             "CIA IND (Companhia Independente)",
-            options=cia_disponiveis,
-            default=[],
-            placeholder="Todas",
-            key="f_cia",
+            options=cia_disponiveis, default=[], placeholder="Todas", key="f_cia",
         )
 
         if f_cob or f_bbm or f_cia:
@@ -698,9 +830,7 @@ if tem_unidades:
 else:
     st.sidebar.info("Filtro por unidade indisponível (dados de unidades não carregados).")
 
-# -------------------------------------------------------------
-# Aplicação do filtro de unidade
-# -------------------------------------------------------------
+# Aplicação do filtro
 mascara_unidade = pd.Series(True, index=df.index)
 if f_cob:
     mascara_unidade &= df["cob_nome"].isin(f_cob)
@@ -710,12 +840,11 @@ if f_cia:
     mascara_unidade &= df["cia_ind_nome"].isin(f_cia)
 
 df_filt = df[mascara_unidade].copy()
-
 st.sidebar.markdown(f"**Chamadas após filtros:** `{len(df_filt)}`")
 
 
 # =============================================================
-# CABEÇALHO DE DESTAQUE
+# CABEÇALHO
 # =============================================================
 st.markdown("""
     <div class="cbmmg-header">
@@ -730,7 +859,7 @@ st.markdown(
 
 
 # =============================================================
-# CARDS DE DESTAQUE (KPIs)
+# KPIs
 # =============================================================
 def render_metric_card(col, valor, rotulo, cor_fundo: str):
     col.markdown(f"""
@@ -781,14 +910,11 @@ st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
 
 
 # =============================================================
-# ABAS — Mapa (principal) e Indicadores
+# ABAS
 # =============================================================
 aba_mapa, aba_indicadores = st.tabs(["🗺️ Mapa", "📊 Indicadores"])
 
 
-# -------------------------------------------------------------
-# Cores por situação de atendimento
-# -------------------------------------------------------------
 CORES_ATENDIMENTO = {
     "AO": "#2ca02c", "DP": "#bcbd22", "ED": "#e377c2",
     "NL": "#d62728", "AC": "#1f77b4", "EC": "#d62728",
@@ -819,9 +945,8 @@ with aba_mapa:
             .map(CORES_ATENDIMENTO).fillna("#cccccc")
         )
 
-        centro_mg = [-18.5, -44.5]
         mapa = folium.Map(
-            location=centro_mg,
+            location=[-18.5, -44.5],
             zoom_start=6,
             tiles="OpenStreetMap",
             attr="Leaflet | © OpenStreetMap contributors",
@@ -917,14 +1042,17 @@ with aba_indicadores:
         if nat_count.empty:
             st.info("Sem naturezas para exibir.")
         else:
-            top_n = st.slider(
-                "Exibir top N naturezas",
-                min_value=5,
-                max_value=min(40, len(nat_count)),
-                value=min(20, len(nat_count)),
-                step=1,
-                key="top_n_naturezas",
-            )
+            max_val = min(40, len(nat_count))
+            if max_val >= 5:
+                top_n = st.slider(
+                    "Exibir top N naturezas",
+                    min_value=5, max_value=max_val,
+                    value=min(20, max_val), step=1,
+                    key="top_n_naturezas",
+                )
+            else:
+                top_n = max_val
+
             nat_plot = nat_count.head(top_n)
             fig_nat = px.bar(
                 nat_plot, x="qtd", y="Natureza", orientation="h",
@@ -1084,7 +1212,7 @@ with aba_indicadores:
 
 
 # -------------------------------------------------------------
-# Rodapé da sidebar
+# Rodapé
 # -------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.caption(
