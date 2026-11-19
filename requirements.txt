@@ -1,7 +1,7 @@
-streamlit==1.66.0
-pandas>=2.0,<3.0
+streamlit==1.67.0
+pandas>=2.0,<4.0
 plotly>=5.0,<8.0
-folium>=0.19,<1.0
+folium>=0.19,<2.0
 streamlit-folium>=0.22,<1.0
 requests>=2.31.0,<3.0
 streamlit-autorefresh>=0.1.0
